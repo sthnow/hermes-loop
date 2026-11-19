@@ -19,7 +19,7 @@
 const { createHash, randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const fs = require('node:fs')
-const { join, resolve, sep } = require('node:path')
+const { join, resolve, sep, posix, win32 } = require('node:path')
 const { homedir } = require('node:os')
 // settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）。
 // 不能依赖打包依赖：宿主沙箱 require 解析 .pnpm 软链邻居时抛 ERR_INTERNAL_ASSERTION。
@@ -272,30 +272,39 @@ function memoryDir() {
   return join(dshHome(), 'memory')
 }
 
-// ── 工作区记忆（design §13，v0.6）─────────────────────────────────────────
-// 往 ~/.dsh 下写、仅用 cwd 给目录命名——不推导项目根（2026-08-29 评审否决的是
-// 往项目目录里写，cwd 向上找 .git 不稳定；这里 cwd 字符串本身就是权威输入，
-// 宿主在会话创建时校验必须为绝对路径）。slug 参考 Claude Code：路径分隔符与
-// 盘符冒号逐字折成 '-'，如 /Users/mac/proj → -Users-mac-proj。
-const WORKSPACE_SLUG_MAX = 128
+// Workspace identity is based on the session's absolute cwd, not a derived project root.
+function canonicalWorkspaceCwd(cwd) {
+  if (typeof cwd !== 'string' || /[\x00-\x1f\x7f]/.test(cwd)) return undefined
+  const drive = /^[a-z]:[\\/]/i.test(cwd)
+  const unc = /^\\\\[^\\/?\.][^\\/]*[\\/][^\\/]+/.test(cwd)
+  if (drive || unc) {
+    if (cwd.split(/[\\/]/).includes('..')) return undefined
+    const p = win32.normalize(cwd).replace(/^[a-z]:/i, (s) => s.toUpperCase())
+    return p === win32.parse(p).root ? p : p.replace(/\\+$/, '')
+  }
+  if (!cwd.startsWith('/') || cwd.split('/').includes('..')) return undefined
+  return posix.normalize(cwd).replace(/\/+$/, '') || '/'
+}
 function workspaceSlug(cwd) {
-  if (typeof cwd !== 'string' || cwd.trim() === '') return undefined
-  const slug = cwd.replace(/[/\\:]/g, '-')
-  if (slug.length <= WORKSPACE_SLUG_MAX) return slug
-  // 超长路径截断并接哈希防碰撞（sha256 定义在下方 helper 区，运行时已就位）
-  return slug.slice(0, WORKSPACE_SLUG_MAX - 9) + '-' + sha256(cwd).slice(0, 8)
+  const key = canonicalWorkspaceCwd(cwd)
+  if (key === undefined) return undefined
+  const label = key.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'root'
+  return 'v2-' + label + '-' + sha256(key)
 }
 function workspaceMemoryDir(cwd) {
   const slug = workspaceSlug(cwd)
   return slug === undefined ? undefined : join(memoryDir(), 'workspaces', slug)
 }
-// slug 不可逆（路径里的 '-' 与分隔符都折成 '-'），工作区文件标题下写一行
-// cwd 注释自描述——§ 解析天然忽略它，面板与人工编辑都能读到真实路径。
-const workspaceCwdHeader = (cwd) => `<!-- cwd: ${cwd} -->`
+const workspaceCwdHeader = (cwd) => '<!-- cwd: ' + cwd + ' -->'
 function workspaceCwdOf(raw) {
-  const m = String(raw || '').match(/^<!-- cwd: (.+) -->$/m)
-  return m === null ? undefined : m[1].trim()
+  const matches = [...String(raw || '').matchAll(/^<!-- cwd: (.+) -->\r?$/gm)]
+  return matches.length === 1 ? matches[0][1] : undefined
 }
+function workspaceOwnerMatches(raw, cwd) {
+  const key = canonicalWorkspaceCwd(cwd)
+  return key !== undefined && key === canonicalWorkspaceCwd(workspaceCwdOf(raw))
+}
+
 
 // scope 即 agent 对象（dsh-agent dispatch assembleContextFor 返回 { agent, scope: agent }），
 // agent.session 是公开字段；任何一环缺席/抛错都按无 cwd 处理（退回纯全局层）。
@@ -714,24 +723,93 @@ function planMemoryChange(entries, mem, { limit }) {
   return { ok: false, result: 'rejected', reason: 'unknown-action', detail: mem.action }
 }
 
-/**
- * memory writer：读库 → 纯守卫 → 整文件重排 → 原子写。skill 结论与 memory 结论
- * 同在全局串行队列内顺序执行（§3.6），插件内无并发，整文件重写免 CAS；
- * 用户手改由"写入前重读"自愈。
- * @returns {result, store, chars?, entries?, limit?, reason?, detail?}
- */
-async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enabled = {}, header } = {}) {
+/** Update only the selected entry line; preserve all unrelated text and line endings. */
+function editMemoryDocument(raw, mem, plan) {
+  if (mem.action === 'add') {
+    const eol = raw.match(/\r?\n/)?.[0] || '\n'
+    return raw + (raw === '' || raw.endsWith('\n') ? '' : eol) + '§ ' + plan.entries.at(-1) + eol
+  }
+  const chunks = raw.split(/(\r?\n)/)
+  let index = 0
+  for (let i = 0; i < chunks.length; i += 2) {
+    const text = parseMemoryEntries(chunks[i])[0]
+    if (text === undefined) continue
+    if (text.includes(mem.oldText)) {
+      if (mem.action === 'remove') chunks.splice(i, 2)
+      else chunks[i] = '§ ' + plan.entries[index]
+      break
+    }
+    index += 1
+  }
+  return chunks.join('')
+}
+
+async function readMemoryBytes(file) {
+  try {
+    const stat = await fsP.lstat(file)
+    if (!stat.isFile()) throw Object.assign(new Error('not a regular memory file'), { code: 'NOT_REGULAR' })
+    return await fsP.readFile(file)
+  } catch (e) { if (e?.code !== 'ENOENT') throw e; return undefined }
+}
+
+/** Serialize cooperating writers; detect external edits before adopting a staged file. */
+async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enabled = {}, header, canWrite } = {}) {
   const store = mem.store
   if (enabled[store] === false) return { result: 'store-disabled', store }
   const file = join(dir, store === 'user' ? 'USER.md' : 'MEMORY.md')
   const limit = limits[store]
-  let raw = ''
-  try { raw = await fsP.readFile(file, 'utf8') } catch { /* 新库：空文件起步 */ }
-  const plan = planMemoryChange(parseMemoryEntries(raw), mem, { limit })
-  if (!plan.ok) return { ...plan, store, limit }
-  await atomicWrite(file, serializeMemoryEntries(store, plan.entries, header))
-  return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
+  const reject = (reason, detail) => ({ result: 'rejected', store, limit, reason, detail })
+  const lock = file + '.lock'
+  const temp = file + '.' + randomUUID() + '.tmp'
+  await fsP.mkdir(dir, { recursive: true })
+  if (!(await fsP.lstat(dir)).isDirectory()) return reject('store-directory-invalid')
+  let lockHandle
+  try { lockHandle = await fsP.open(lock, 'wx', 0o600) }
+  catch (e) { if (e?.code === 'EEXIST') return reject('store-busy'); throw e }
+  try {
+    let original, raw
+    try {
+      original = await readMemoryBytes(file)
+      raw = original === undefined ? '' : original.toString('utf8')
+      // Refuse a lossy decode, including invalid UTF-8 in hand-edited files.
+      if (original && !Buffer.from(raw, 'utf8').equals(original)) return reject('store-read-failed', 'invalid UTF-8')
+    } catch (e) { return reject('store-read-failed', e?.code) }
+    if (original !== undefined && header !== undefined && !workspaceOwnerMatches(raw, workspaceCwdOf(header))) {
+      return reject('workspace-owner-mismatch')
+    }
+    const plan = planMemoryChange(parseMemoryEntries(raw), mem, { limit })
+    if (!plan.ok) return { ...plan, store, limit }
+    const next = original === undefined
+      ? serializeMemoryEntries(store, plan.entries, header)
+      : editMemoryDocument(raw, mem, plan)
+    try {
+      await fsP.writeFile(temp, next, { flag: 'wx', mode: 0o600, flush: true })
+      if (canWrite && !canWrite()) return reject('write-policy-changed')
+      if (original !== undefined) {
+        const snapshot = temp + '.previous'
+        try {
+          await fsP.writeFile(snapshot, original, { flag: 'wx', mode: 0o600, flush: true })
+          const current = await readMemoryBytes(file)
+          if (!current?.equals(original)) return reject('store-conflict')
+          if (canWrite && !canWrite()) return reject('write-policy-changed')
+          await fsP.rename(snapshot, file + '.previous')
+        } finally { await fsP.rm(snapshot, { force: true }) }
+        const current = await readMemoryBytes(file)
+        if (!current?.equals(original)) return reject('store-conflict')
+        if (canWrite && !canWrite()) return reject('write-policy-changed')
+        await fsP.rename(temp, file)
+      } else {
+        // Link publishes an already complete file without replacing a newly created store.
+        try { await fsP.link(temp, file) }
+        catch (e) { if (e?.code === 'EEXIST') return reject('store-conflict'); throw e }
+      }
+    } finally { await fsP.rm(temp, { force: true }) }
+    return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
+  } finally {
+    try { await lockHandle.close() } finally { await fsP.rm(lock, { force: true }) }
+  }
 }
+
 
 // ── Model-facing copy, one entry per supported language ─────────────────────
 //
@@ -1287,7 +1365,11 @@ module.exports = {
             let raw = ''
             try {
               const dir = workspaceMemoryDir(cwd)
-              if (dir !== undefined) raw = fs.readFileSync(join(dir, 'MEMORY.md'), 'utf8')
+              if (dir !== undefined) {
+                const file = join(dir, 'MEMORY.md')
+                if (fs.lstatSync(dir).isDirectory() && fs.lstatSync(file).isFile()) raw = fs.readFileSync(file, 'utf8')
+                if (!workspaceOwnerMatches(raw, cwd)) raw = ''
+              }
             } catch { raw = '' }
             workspace = { label: cwd, raw }
           }
@@ -1646,7 +1728,11 @@ module.exports = {
               const dir = workspaceMemoryDir(cwd)
               if (dir !== undefined) {
                 let wRaw = ''
-                try { wRaw = await fsP.readFile(join(dir, 'MEMORY.md'), 'utf8') } catch { /* 新库 */ }
+                try {
+                  const bytes = (await fsP.lstat(dir)).isDirectory() ? await readMemoryBytes(join(dir, 'MEMORY.md')) : undefined
+                  const raw = bytes?.toString('utf8')
+                  if (raw && workspaceOwnerMatches(raw, cwd)) wRaw = raw
+                } catch { /* no verified workspace store */ }
                 stores.push({ store: 'memory', entries: parseMemoryEntries(wRaw), variant: 'workspace' })
               }
             }
@@ -1768,17 +1854,20 @@ module.exports = {
     }
 
     const dispatchConclusion = async (conclusion, { eff, sessionId, session }) => {
+      const sessionCwd = scopeCwd({ session })
+      const project = conclusion.memory?.store === 'memory' && conclusion.memory.scope === 'project' && conclusion.memory.action !== 'nothing'
+      const wsDir = project ? workspaceMemoryDir(sessionCwd) : undefined
+      if (project && wsDir === undefined) {
+        trace('memory-outcome', { sessionId, store: 'memory', action: conclusion.memory.action, scope: 'project', result: 'rejected', reason: 'workspace-missing' })
+        ctx.logger.warn('hermes-loop: project memory rejected: workspace missing')
+        if (conclusion.action === 'nothing') return
+        conclusion = { ...conclusion, memory: undefined }
+      }
       const hasSkill = conclusion.action !== 'nothing'
       const hasMemory = conclusion.memory !== undefined && conclusion.memory.action !== 'nothing'
       const logHead = hasSkill
         ? `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
         : `hermes-loop: memory ${conclusion.memory.action}@${conclusion.memory.store} (from session ${sessionId})`
-      // §13 scope 路由：store="memory" + scope="project" + cwd 已知时落工作区库（常开，
-      // 落点由复盘 agent 的 scope 决定）；cwd 缺席的 project 结论回退全局库——fail-open 保数据
-      const sessionCwd = session && session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
-      const wsDir = hasMemory && conclusion.memory.store === 'memory' && conclusion.memory.scope === 'project'
-        ? workspaceMemoryDir(sessionCwd)
-        : undefined
       trace('dispatch', {
         sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill,
         memory: hasMemory ? `${conclusion.memory.store}:${conclusion.memory.action}` : undefined,
@@ -1834,7 +1923,7 @@ module.exports = {
         if (verb !== undefined) {
           ctx.logger.info(`${memHead} — ${outcome.result} (${outcome.chars}/${outcome.limit} chars, ${outcome.entries} entries)`)
           // 注入是会话首冻结（§12.2）：明示"下个会话生效"，不让用户以为当前会话立即可见
-          notifySourceSession(session, `后台复盘已${verb}记忆（${storeLabel}，${outcome.chars}/${outcome.limit} 字符，下个会话生效）${mem.rationale ? `：${mem.rationale}` : ''}`)
+          notifySourceSession(session, `后台复盘已${verb}记忆（${storeLabel}，${outcome.chars}/${outcome.limit} 字符；仅写入本机 Loop，当前会话快照不变，下个会话可读）${mem.rationale ? `：${mem.rationale}` : ''}`)
         } else if (outcome.result === 'rejected') {
           ctx.logger.warn(`${memHead} — rejected: ${outcome.reason}. ${outcome.detail || ''}`)
         } else {
@@ -2188,20 +2277,24 @@ module.exports = {
       // 工作区库聚合（§13.4）：枚举 memory/workspaces/*，slug 不可逆所以 cwd 读文件头
       // 注释；单库故障跳过该库不扩散。上限 50 个（正常使用远低于此，防御手工堆积）
       memory.workspaces = []
+      memory.legacyWorkspaceCount = 0
       try {
         const wsRoot = join(memoryDir(), 'workspaces')
         const dirs = (await fsP.readdir(wsRoot, { withFileTypes: true }))
           .filter((d) => d.isDirectory())
           .map((d) => d.name)
           .sort()
-          .slice(0, 50)
-        for (const slug of dirs) {
-          let raw = ''
-          try { raw = await fsP.readFile(join(wsRoot, slug, 'MEMORY.md'), 'utf8') } catch { continue }
+        const versioned = dirs.filter((slug) => /^v2-[a-z0-9-]+-[0-9a-f]{64}$/.test(slug))
+        memory.legacyWorkspaceCount = dirs.length - versioned.length
+        for (const slug of versioned.slice(0, 50)) {
+          let raw
+          try { raw = (await readMemoryBytes(join(wsRoot, slug, 'MEMORY.md')))?.toString('utf8') } catch { continue }
+          const cwd = workspaceCwdOf(raw)
+          if (workspaceSlug(cwd) !== slug) continue
           const entries = parseMemoryEntries(raw)
           memory.workspaces.push({
             slug,
-            cwd: workspaceCwdOf(raw),
+            cwd,
             enabled: eff.memoryEnabled !== false,
             chars: memoryCharsOf(entries),
             limit: eff.memoryCharLimit,

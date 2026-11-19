@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 
 // 测试全程把 DSH_HOME 指向临时目录：插件的 activity.jsonl 审计日志与全局
@@ -1379,6 +1380,54 @@ test('applyMemoryConclusion: add/dup/replace/remove land in dir; store-disabled 
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('memory writer preserves non-entry bytes and saves the preimage', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    const file = join(dir, 'MEMORY.md')
+    const original = '# Personal notes\r\n<!-- keep -->\r\n\r\n§ target  \r\nmanual prose\r\n§ unchanged  \nlast line'
+    await writeFile(file, original)
+    const result = await applyMemoryConclusion({ action: 'replace', store: 'memory', oldText: 'target', text: 'fixed' }, { dir })
+    assert.equal(result.result, 'replaced')
+    assert.equal(await readFile(file, 'utf8'), original.replace('§ target  ', '§ fixed'))
+    assert.equal(await readFile(file + '.previous', 'utf8'), original)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('memory writer rejects unreadable stores and an existing writer lock', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    const file = join(dir, 'MEMORY.md')
+    const mem = { action: 'add', store: 'memory', text: 'new fact' }
+    await mkdir(file)
+    assert.equal((await applyMemoryConclusion(mem, { dir })).reason, 'store-read-failed')
+    assert.deepEqual(await readdir(dir), ['MEMORY.md'])
+    await rm(file, { recursive: true })
+    await writeFile(file, '§ keep\n')
+    await writeFile(file + '.lock', 'other instance')
+    assert.equal((await applyMemoryConclusion(mem, { dir })).reason, 'store-busy')
+    assert.equal(await readFile(file, 'utf8'), '§ keep\n')
+    assert.equal(await readFile(file + '.lock', 'utf8'), 'other instance')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('memory writer checks owner, live policy and intervening edits before commit', async () => {
+  const dir = await tempGlobalDir()
+  const file = join(dir, 'MEMORY.md')
+  const mem = { action: 'add', store: 'memory', text: 'new fact' }
+  try {
+    const original = '# MEMORY\n<!-- cwd: /other -->\n\n§ keep\n'
+    await writeFile(file, original)
+    assert.equal((await applyMemoryConclusion(mem, { dir, header: '<!-- cwd: /expected -->' })).reason, 'workspace-owner-mismatch')
+    assert.equal((await applyMemoryConclusion(mem, { dir, canWrite: () => false })).reason, 'write-policy-changed')
+    assert.equal(await readFile(file, 'utf8'), original)
+    const edited = original + 'Manual edit\n'
+    const result = await applyMemoryConclusion(mem, { dir, canWrite: () => { writeFileSync(file, edited); return true } })
+    assert.equal(result.reason, 'store-conflict')
+    assert.equal(await readFile(file, 'utf8'), edited)
+    assert.deepEqual(await readdir(dir), ['MEMORY.md'])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('memory context: session-frozen snapshots (Hermes semantics) — mid-session writes only visible to new sessions', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-memctx-'))
   const oldHome = process.env.DSH_HOME
@@ -1527,7 +1576,7 @@ test('memory e2e: skill=nothing with memory add writes USER.md, echoes a notice,
   try {
     assert.match(await readFile(join(home, 'memory', 'USER.md'), 'utf8'), /§ user prefers terse answers/)
     assert.ok(notices.some((n) => n.source && n.source.form === 'notice' && n.source.summary.includes('记忆')), notices.map((n) => n.source && n.source.summary).join('|'))
-    assert.ok(notices.some((n) => n.source.summary.includes('下个会话生效')), 'echo must state next-session semantics')
+    assert.ok(notices.some((n) => n.source.summary.includes('仅写入本机 Loop') && n.source.summary.includes('当前会话快照不变，下个会话可读')), 'echo must state local and next-session semantics')
     // 当前记忆条目注入 review prompt（oldText 定位与去重的基准）+ 记忆规则段（按需产出）
     assert.ok(JSON.stringify(followup).includes('当前记忆条目'))
     assert.ok(JSON.stringify(followup).includes('多数复盘应该没有记忆'))
@@ -1668,28 +1717,25 @@ const {
   renderReviewMemoryBlock,
 } = plugin.__internals
 
-test('workspaceSlug: cwd 折成 Claude 风格 slug；空/非法输入返回 undefined；超长截断带哈希', () => {
-  assert.equal(workspaceSlug('/Users/mac/projects/ts/dsh-plugins'), '-Users-mac-projects-ts-dsh-plugins')
-  assert.equal(workspaceSlug('C:\\code\\proj'), 'C--code-proj')
-  assert.equal(workspaceSlug('/x'), '-x')
-  assert.equal(workspaceSlug(undefined), undefined)
-  assert.equal(workspaceSlug(''), undefined)
-  assert.equal(workspaceSlug('   '), undefined)
-  assert.equal(workspaceSlug(42), undefined)
-  // 超长路径：≤128 字符、带 8 位哈希后缀、同输入确定性
+test('workspaceSlug hashes every valid normalized absolute path', () => {
+  assert.notEqual(workspaceSlug('/a-b/c'), workspaceSlug('/a/b-c'))
+  assert.equal(workspaceSlug('/tmp/proj/.//'), workspaceSlug('/tmp/proj'))
+  assert.equal(workspaceSlug('c:\\Users\\dev\\.'), workspaceSlug('C:/Users/dev/'))
+  for (const invalid of [undefined, '', '   ', 42, 'relative/path', 'C:relative', '/bad\npath']) {
+    assert.equal(workspaceSlug(invalid), undefined)
+  }
   const longCwd = '/very/' + 'deep/'.repeat(40) + 'leaf'
   const slug = workspaceSlug(longCwd)
-  assert.ok(slug.length <= 128, `slug length ${slug.length} must be ≤128`)
-  assert.equal(slug, workspaceSlug(longCwd), 'deterministic')
-  assert.notEqual(slug, workspaceSlug(longCwd + '2'), 'different paths must not collide on the prefix')
-  assert.match(slug, /-[0-9a-f]{8}$/, 'truncated slug carries an 8-char hash suffix')
+  assert.ok(slug.length <= 128)
+  assert.notEqual(slug, workspaceSlug(longCwd + '2'))
+  assert.match(slug, /^v2-[a-z0-9-]+-[0-9a-f]{64}$/)
 })
 
-test('workspaceMemoryDir 与 cwd 头注释：目录解析、slug 不可逆时的自描述回读', () => {
-  const dir = workspaceMemoryDir('/Users/mac/proj')
-  assert.equal(dir, join(process.env.DSH_HOME, 'memory', 'workspaces', '-Users-mac-proj'))
+test('workspaceMemoryDir uses a stable hash and keeps the owner comment readable', () => {
+  const cwd = '/Users/mac/proj'
+  assert.equal(workspaceMemoryDir(cwd), join(process.env.DSH_HOME, 'memory', 'workspaces', workspaceSlug(cwd)))
   assert.equal(workspaceMemoryDir(undefined), undefined)
-  assert.equal(workspaceCwdOf(`# MEMORY\n${workspaceCwdHeader('/Users/mac/proj')}\n\n§ a\n`), '/Users/mac/proj')
+  assert.equal(workspaceCwdOf('# MEMORY\n' + workspaceCwdHeader(cwd) + '\n\n§ a\n'), cwd)
   assert.equal(workspaceCwdOf('# MEMORY\n\n§ a\n'), undefined)
 })
 
@@ -1816,22 +1862,23 @@ test('memory e2e: scope:project 写入工作区库（带 cwd 头注释），全�
   }
 })
 
-test('memory e2e: scope:project 在 cwd 缺席时回退全局库（fail-open 保数据）', async () => {
+test('memory e2e: scope:project missing cwd never writes or stages global memory', async () => {
   const conclusion = JSON.stringify({
     action: 'nothing',
     memory: { action: 'add', store: 'memory', scope: 'project', text: 'fallback fact' },
   })
-  // cwd 缺席（header {}）→ 全局库
-  const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
-  try {
-    assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
-    let wsAbsent = false
-    try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
-    assert.ok(wsAbsent, 'no workspace dir may be created without cwd')
-  } finally {
-    if (oldHome === undefined) delete process.env.DSH_HOME
-    else process.env.DSH_HOME = oldHome
-    await rm(home, { recursive: true, force: true })
+  for (const mode of ['auto', 'approval']) {
+    const { home, oldHome, notices, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode }, conclusion)
+    try {
+      assert.equal(notices.length, 0)
+      await assert.rejects(readFile(join(home, 'memory', 'MEMORY.md')), { code: 'ENOENT' })
+      await assert.rejects(readdir(join(home, 'hermes-loop', 'pending')), { code: 'ENOENT' })
+    } finally {
+      for (const cleanup of t.cleanups) if (typeof cleanup === 'function') cleanup()
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true, maxRetries: 4 })
+    }
   }
 })
 
@@ -1934,11 +1981,18 @@ test('GET status 聚合工作区库：slug/cwd/chars/entries/items 齐备', asyn
   })
   const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion, { cwd })
   try {
+    const wsRoot = join(home, 'memory', 'workspaces')
+    for (const slug of ['legacy-slug', workspaceSlug('/tmp/mismatch')]) {
+      const dir = join(wsRoot, slug)
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'MEMORY.md'), '# MEMORY\n<!-- cwd: /tmp/unverified -->\n§ excluded fact\n')
+    }
     const route = t.routes[0]
     const res = fakeRes()
     await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
     const body = JSON.parse(res.body)
     assert.ok(Array.isArray(body.memory.workspaces), 'status carries the workspaces array')
+    assert.equal(body.memory.legacyWorkspaceCount, 1)
     assert.equal(body.memory.workspaces.length, 1)
     const ws = body.memory.workspaces[0]
     assert.equal(ws.slug, workspaceSlug(cwd))
