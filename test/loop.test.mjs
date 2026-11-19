@@ -252,6 +252,21 @@ function setupPlugin(config, services) {
 
 const completedTurn = { type: 'turn/end', data: { reason: { kind: 'completed' } } }
 
+test('review followup is a complete user message for persisted session replay', async () => {
+  const services = fakeServices(JSON.stringify({ action: 'nothing', rationale: 'contract test' }))
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  try {
+    t.fire({ id: 'session-role-contract', header: {}, deriveMessages: () => [{ role: 'user', content: 'hi' }] }, completedTurn)
+    await new Promise((r) => setTimeout(r, 80))
+    const messages = services.created.filter((c) => c && c.content)
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0].role, 'user')
+    assert.deepEqual(messages[0].source, { kind: 'user' })
+    assert.equal(messages[0].content[0].type, 'text')
+    assert.ok(messages[0].content[0].text.length > 0)
+  } finally { for (const cleanup of t.cleanups) if (typeof cleanup === 'function') cleanup() }
+})
+
 test('loop end-to-end: threshold fires review, log-only mode logs the conclusion', async () => {
   const conclusion = JSON.stringify({ action: 'nothing', rationale: 'one-off task' })
   const services = fakeServices('```json\n' + conclusion + '\n```')
@@ -1403,6 +1418,29 @@ test('memory context: session-frozen snapshots (Hermes semantics) — mid-sessio
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('source notice is a complete user message in approval and auto modes', async (t) => {
+  for (const mode of ['approval', 'auto']) {
+    await t.test(mode, async () => {
+      const conclusion = JSON.stringify({ action: 'create', skill: 'role-contract-skill', description: 'test fixture', body: 'test body' })
+      const { home, oldHome, notices, t: harness } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode }, conclusion)
+      try {
+        assert.equal(notices.length, 1)
+        const notice = notices[0]
+        assert.equal(notice.role, 'user')
+        assert.equal(notice.source.kind, 'plugin')
+        assert.equal(notice.source.plugin, 'hermes-loop')
+        assert.equal(notice.source.form, 'notice')
+        assert.deepEqual(notice.content, [{ type: 'text', text: notice.source.summary }])
+      } finally {
+        for (const cleanup of harness.cleanups) if (typeof cleanup === 'function') cleanup()
+        if (oldHome === undefined) delete process.env.DSH_HOME
+        else process.env.DSH_HOME = oldHome
+        await rm(home, { recursive: true, force: true })
+      }
+    })
   }
 })
 

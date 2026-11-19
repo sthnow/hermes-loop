@@ -1698,7 +1698,7 @@ module.exports = {
             memoryBlock,
             '\n## ' + IT.transcript + '\n' + transcriptText,
           ].filter(Boolean).join('\n\n')
-          agent.followup({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
+          agent.followup({ role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
           await agent.whenIdle()
         } finally {
           clearInterval(timer)
@@ -1757,6 +1757,7 @@ module.exports = {
         // append 是异步的（dsh Session.append 返回 promise）：会话句柄已关闭时
         // reject 会走进程级 unhandledRejection——issue #7 的同款致命路径，必须挂住
         const appended = session.append('user/message', {
+          role: 'user',
           content: [{ type: 'text', text: summary }],
           source: { kind: 'plugin', plugin: 'hermes-loop', form: 'notice', summary },
         })
