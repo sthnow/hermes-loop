@@ -108,7 +108,7 @@ skill writer                                   memory writer（§12，同队列�
      controller 从 perSession 摘除 → 出队下一个 queuedTask
    ```
 
-   对齐 Hermes 的 2 秒取消语义——dsh 侧排队任务直接丢弃即可，运行中的靠 AbortSignal；
+   队列仅存于当前进程（状态接口 `queueDurability: "volatile"`，`queuedCount` 为等待数），重启或卸载后不恢复，与已写盘的审批暂存不同。自动复盘出队时重读开关；仅由信号触发的任务在信号开关关闭时跳过。复盘结论落盘前检查当前模式及目标通道开关。手动复盘仍绕过自动触发开关、阈值和冷却，但受前台取消、模式和目标通道开关约束。
 7. **生命周期清理**：session/event 监听、review 队列、perSession map、每个在跑 review 的 AbortController 全部挂进 `ctx.effect()` 返回的清理函数（对齐 scheduled-items / skills-management 的做法），dispose 时 abort 全部在跑 review 并清空队列，防止热重载泄漏监听与后台 agent。
 
 成本核算：单次 review 输入 = 末尾 N 条消息（截断到 `maxTranscriptChars`，默认 ~12K 字符）+ skill 清单（几十条 × ≤500 字符）≈ 5-10K token；触发频率 = 每 10 turn 一次。比 Hermes 的全量重放（30K+）便宜。
@@ -152,7 +152,7 @@ skill writer                                   memory writer（§12，同队列�
 
 - `tools.restrict({ allow: [] })`：review agent 无任何工具，纯文本进出；
 - 独立 sessionId 命名空间 + `origin: 'subagent'`：不出现在用户会话列表的根层；
-- `signal`：全局 dispose / 队列超时（`reviewTimeoutSec` 默认 300）时 abort；
+- `reviewTimeoutSec`（默认 300，最小 30）从开始复盘计时，覆盖技能快照、输入读取、agent 创建及等待空闲，不含排队或已启动的持久化。前台新 turn 或插件卸载也可取消。因宿主 issue #7，不向 `agents.create` 传父级 signal；迟到的句柄只尝试取消和释放，不再发送 prompt。已取得的句柄最多等待 5 秒清理，超时后继续出队；这不保证宿主已经释放资源。
 - 不调用 `sessions.flush` 持久化 review 会话，用完即弃（内存态）。
 
 ## 5. systemPrompt 触发纪律（辅助，非依赖）

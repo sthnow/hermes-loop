@@ -519,7 +519,7 @@ function mergeFrontmatter(existingContent, name, description, newBody) {
  * atomic temp-file rename. Never writes outside `globalDir`.
  * @returns a short result descriptor (for logs and the caller's bookkeeping).
  */
-async function applyConclusion(conclusion, { globalDir, now = new Date().toISOString() } = {}) {
+async function applyConclusion(conclusion, { globalDir, now = new Date().toISOString(), canWrite } = {}) {
   if (conclusion.action === 'nothing') return { result: 'nothing' }
   const targetDir = join(globalDir, conclusion.skill)
   const targetFile = join(targetDir, 'SKILL.md')
@@ -531,7 +531,7 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
       return { result: 'create-conflict', detail: `skill '${conclusion.skill}' already exists; refusing to overwrite (merge is v3 Curator work)` }
     }
     const content = buildSkillMd(conclusion.skill, conclusion.description, conclusion.body)
-    await atomicWrite(targetFile, content)
+    if (!await atomicWrite(targetFile, content, canWrite)) return { result: 'write-policy-changed' }
     return { result: 'created', path: targetFile }
   }
 
@@ -554,7 +554,7 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
   const content = mergeFrontmatter(current, conclusion.skill, description, conclusion.body)
-  await atomicWrite(targetFile, content)
+  if (!await atomicWrite(targetFile, content, canWrite)) return { result: 'write-policy-changed' }
   return { result: 'patched', path: targetFile, at: now }
 }
 
@@ -582,11 +582,20 @@ function stripFrontmatter(raw) {
 }
 
 /** temp file + rename in the same directory → readers never see a half file. */
-async function atomicWrite(targetFile, content) {
+async function atomicWrite(targetFile, content, canWrite) {
+  if (canWrite && !canWrite()) return false
   await fsP.mkdir(join(targetFile, '..'), { recursive: true })
   const temp = join(join(targetFile, '..'), `.${randomUUID()}.tmp`)
-  await fsP.writeFile(temp, content, 'utf8')
-  await fsP.rename(temp, targetFile)
+  let adopted = false
+  try {
+    await fsP.writeFile(temp, content, 'utf8')
+    if (canWrite && !canWrite()) return false
+    await fsP.rename(temp, targetFile)
+    adopted = true
+    return true
+  } finally {
+    if (!adopted) { try { await fsP.unlink(temp) } catch {} }
+  }
 }
 
 /**
@@ -1622,16 +1631,58 @@ module.exports = {
     }
 
     const drainNext = () => {
-      if (running !== null || queued.size === 0) return
-      const [nextSessionId, task] = queued.entries().next().value
-      queued.delete(nextSessionId)
-      // 直接同步调用：running 必须在同一调用栈内置位。隔一个微任务会让并发的
-      // 下一个事件也看到 running===null，串行不变量被击穿
-      task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
+      // A policy-rejected task does not take the slot. Continue until one does.
+      while (running === null && queued.size > 0) {
+        const [nextSessionId, task] = queued.entries().next().value
+        queued.delete(nextSessionId)
+        task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
+      }
     }
 
-    const runReview = async ({ session, eff, manual = false }) => {
+    // Stop waiting even if a host operation ignores abort. Keep both handlers
+    // attached to that operation so late rejections cannot become unhandled.
+    const untilReviewAbort = (signal, op, onLate) => new Promise((resolve, reject) => {
+      signal.throwIfAborted()
+      const abort = () => reject(signal.reason)
+      signal.addEventListener('abort', abort, { once: true })
+      const finish = () => signal.removeEventListener('abort', abort)
+      Promise.resolve().then(() => {
+        signal.throwIfAborted()
+        return op()
+      }).then((value) => {
+        finish()
+        if (signal.aborted) {
+          try { onLate?.(value) } catch {}
+        } else resolve(value)
+      }, (error) => {
+        finish()
+        reject(error)
+      })
+    })
+
+    const cancelReviewAgent = (agent) => {
+      try { Promise.resolve(agent.cancel({ kind: 'parent' })).catch(() => {}) } catch {}
+    }
+    const disposeReviewHandle = async (handle, sessionId) => {
+      let timer
+      try {
+        const timedOut = await Promise.race([
+          new Promise((resolve) => { timer = setTimeout(() => resolve(true), 5000); timer.unref?.() }),
+          Promise.resolve().then(() => handle.dispose()).then(() => false),
+        ])
+        if (timedOut) ctx.logger.warn(`hermes-loop: review handle disposal timed out for session ${sessionId}`)
+      } catch {} finally { clearTimeout(timer) }
+    }
+
+    const autoReviewAllowed = (eff, signalOnly) => eff.enabled && (!signalOnly || eff.signalTriggerEnabled)
+
+    const runReview = async ({ session, manual = false, signalOnly = false }) => {
       const sessionId = session.id
+      const eff = effective()
+      if (!manual && !autoReviewAllowed(eff, signalOnly)) {
+        trace('review-skipped', { sessionId, reason: 'review-policy-changed' })
+        return
+      }
       const controller = new AbortController()
       const st = stateFor(sessionId)
       // 计数器在进入 runner 时重置（abort 也算消耗窗口，防重触发循环）；
@@ -1646,7 +1697,11 @@ module.exports = {
       runningSince = new Date().toISOString()
       trace('review-start', { sessionId, manual, signal: firedSignal && firedSignal.kind, signalDetail: firedSignal && firedSignal.detail })
 
+      const { signal } = controller
+      const timeout = setTimeout(() => controller.abort(), Math.max(30, eff.reviewTimeoutSec) * 1000)
+      timeout.unref?.()
       let handle
+      let onAbort
       try {
         // One language decision per review run, so the catalog fallback, the
         // truncation marker, the memory block, the prompt, and the input
@@ -1658,7 +1713,7 @@ module.exports = {
 
         // 2. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
-        const snapshot = await ctx.skills.snapshot({ cwd, signal: controller.signal })
+        const snapshot = await untilReviewAbort(signal, () => ctx.skills.snapshot({ cwd, signal }))
         const catalog = (snapshot.skills || [])
           .filter((s) => s.invocation === undefined || s.invocation.modelInvocable !== false)
           .map((s) => ({
@@ -1680,7 +1735,8 @@ module.exports = {
           if (!resolve(suspect.resourceBase.path).startsWith(globalRoot)) continue
           const file = join(suspect.resourceBase.path, 'SKILL.md')
           let content
-          try { content = await fsP.readFile(file, 'utf8') } catch { continue }
+          try { content = await untilReviewAbort(signal, () => fsP.readFile(file, { encoding: 'utf8', signal })) }
+          catch { signal.throwIfAborted(); continue }
           const hash = sha256(content)
           if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + REVIEW_INPUT_TEXT[lang].truncated
           // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
@@ -1690,26 +1746,21 @@ module.exports = {
 
         // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
         const selection = ctx.agentDefaultModel.currentSelection()
-        // 不把父 signal 传给 agents.create（issue #7）：创建中途被父 signal abort，
-        // dsh 内部会留下一条未接管的 promise 链，unhandledRejection 直接把宿主进程
-        // 带崩（exit 1 / 安全模式）。改在创建完成后登记 cancel 监听；abort 若落在
-        // create 期间，下方 aborted 检查当场补一次 cancel，复盘安静让位。
-        handle = await ctx.agents.create({
+        // Issue #7: never give agents.create the parent signal. A late handle
+        // is cancelled and disposed without sending a prompt or blocking the queue.
+        handle = await untilReviewAbort(signal, () => ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
           setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
+        }), (lateHandle) => {
+          try { cancelReviewAgent(lateHandle.agent) } finally { void disposeReviewHandle(lateHandle, sessionId) }
         })
         const agent = handle.agent
-        const onAbort = () => { try { agent.cancel({ kind: 'parent' }) } catch {} }
-        controller.signal.addEventListener('abort', onAbort, { once: true })
-        if (controller.signal.aborted) {
-          // abort 落在 create 期间（前台打断窗口就在这一两秒）：监听器已错过触发，
-          // 当场补 cancel，复盘安静让位
-          onAbort()
-          ctx.logger.warn(`hermes-loop: review for session ${sessionId} aborted (timeout=${eff.reviewTimeoutSec}s / foreground priority)`)
-          return
-        }
+        onAbort = () => cancelReviewAgent(agent)
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) onAbort()
+        signal.throwIfAborted()
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
@@ -1720,7 +1771,8 @@ module.exports = {
           for (const store of MEMORY_STORES) {
             if (!memoryStoreEnabled(store, eff)) continue
             let raw = ''
-            try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
+            try { raw = await untilReviewAbort(signal, () => fsP.readFile(memoryStoreFile(store), { encoding: 'utf8', signal })) }
+            catch { signal.throwIfAborted() /* 否则视为新库 */ }
             stores.push({ store, entries: parseMemoryEntries(raw) })
             // 工作区层（§13）：紧跟全局 MEMORY 块之后，空库也注入（让模型知道这层存在，
             // scope:"project" 的结论才有落点）；cwd 缺席/非法时不出现
@@ -1729,10 +1781,16 @@ module.exports = {
               if (dir !== undefined) {
                 let wRaw = ''
                 try {
-                  const bytes = (await fsP.lstat(dir)).isDirectory() ? await readMemoryBytes(join(dir, 'MEMORY.md')) : undefined
-                  const raw = bytes?.toString('utf8')
+                  const raw = await untilReviewAbort(signal, async () => {
+                    const file = join(dir, 'MEMORY.md')
+                    if (!(await fsP.lstat(dir)).isDirectory()) return undefined
+                    signal.throwIfAborted()
+                    if (!(await fsP.lstat(file)).isFile()) return undefined
+                    signal.throwIfAborted()
+                    return fsP.readFile(file, { encoding: 'utf8', signal })
+                  })
                   if (raw && workspaceOwnerMatches(raw, cwd)) wRaw = raw
-                } catch { /* no verified workspace store */ }
+                } catch { signal.throwIfAborted() /* otherwise no verified workspace store */ }
                 stores.push({ store: 'memory', entries: parseMemoryEntries(wRaw), variant: 'workspace' })
               }
             }
@@ -1773,8 +1831,6 @@ module.exports = {
         }
         const timer = setInterval(pump, 300)
         if (typeof timer.unref === 'function') timer.unref()
-        const timeout = setTimeout(() => controller.abort(), Math.max(30, eff.reviewTimeoutSec) * 1000)
-        if (typeof timeout.unref === 'function') timeout.unref()
         try {
           const IT = REVIEW_INPUT_TEXT[lang]
           const prompt = [
@@ -1784,20 +1840,16 @@ module.exports = {
             memoryBlock,
             '\n## ' + IT.transcript + '\n' + transcriptText,
           ].filter(Boolean).join('\n\n')
-          agent.followup({ role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
-          await agent.whenIdle()
+          signal.throwIfAborted()
+          await untilReviewAbort(signal, () => agent.followup({ role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } }))
+          await untilReviewAbort(signal, () => agent.whenIdle())
         } finally {
           clearInterval(timer)
-          clearTimeout(timeout)
-          controller.signal.removeEventListener('abort', onAbort)
-          pump()
         }
+        signal.throwIfAborted()
+        pump()
 
         trace('review-output', { sessionId, chars: finalText.length, head: finalText.slice(0, 200) })
-        if (controller.signal.aborted) {
-          ctx.logger.warn(`hermes-loop: review for session ${sessionId} aborted (timeout=${eff.reviewTimeoutSec}s / foreground priority)`)
-          return
-        }
 
         // 5. conclusion → writer
         const conclusion = parseConclusion(finalText)
@@ -1821,14 +1873,22 @@ module.exports = {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
         }
-        await dispatchConclusion(conclusion, { eff, sessionId, session })
+        signal.throwIfAborted()
+        clearTimeout(timeout) // the deadline does not interrupt a live filesystem commit
+        await dispatchConclusion(conclusion, { sessionId, session, signal, manual, signalOnly })
       } catch (e) {
+        if (signal.aborted && e === signal.reason) {
+          ctx.logger.warn(`hermes-loop: review for session ${sessionId} aborted (timeout=${eff.reviewTimeoutSec}s / foreground priority)`)
+          return
+        }
         trace('review-error', { sessionId, message: String(e && e.message || e) })
         throw e
       } finally {
+        clearTimeout(timeout)
+        if (onAbort) signal.removeEventListener('abort', onAbort)
+        if (handle) await disposeReviewHandle(handle, sessionId)
         running = null
         runningSince = null
-        if (handle) { try { await handle.dispose() } catch {} }
         drainNext()
       }
     }
@@ -1853,7 +1913,24 @@ module.exports = {
       } catch (e) { ctx.logger.warn(`hermes-loop: source-session notice: ${e && e.message}`) }
     }
 
-    const dispatchConclusion = async (conclusion, { eff, sessionId, session }) => {
+    const dispatchConclusion = async (conclusion, { sessionId, session, signal, manual, signalOnly }) => {
+      const eff = effective()
+      const canDispatch = (live) => !signal.aborted && (manual || autoReviewAllowed(live, signalOnly))
+      const canWrite = (mode, store) => {
+        const live = effective()
+        return canDispatch(live) && live.mode === mode && (store === undefined || memoryStoreEnabled(store, live))
+      }
+      const policyChanged = () => {
+        trace('write-skipped', { sessionId, reason: 'write-policy-changed' })
+        ctx.logger.info(`hermes-loop: review of session ${sessionId} — write-policy-changed, not written`)
+      }
+      if (!canDispatch(eff)) { policyChanged(); return }
+      if (conclusion.memory !== undefined && conclusion.memory.action !== 'nothing' && !memoryStoreEnabled(conclusion.memory.store, eff)) {
+        trace('memory-outcome', { sessionId, store: conclusion.memory.store, result: 'rejected', reason: 'store-disabled' })
+        ctx.logger.warn(`hermes-loop: memory for session ${sessionId} — rejected: store-disabled`)
+        if (conclusion.action === 'nothing') return
+        conclusion = { ...conclusion, memory: undefined }
+      }
       const sessionCwd = scopeCwd({ session })
       const project = conclusion.memory?.store === 'memory' && conclusion.memory.scope === 'project' && conclusion.memory.action !== 'nothing'
       const wsDir = project ? workspaceMemoryDir(sessionCwd) : undefined
@@ -1884,8 +1961,9 @@ module.exports = {
         const id = `${Date.now().toString(36)}-${label}`
         // memoryDir 记实际目标目录（工作区库或全局库），cwd 供人工审批时核对归属
         const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), memoryDir: wsDir || memoryDir(), cwd: sessionCwd, conclusion }
-        await fsP.mkdir(dir, { recursive: true })
-        await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
+        const staged = await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2),
+          () => canWrite('approval', hasMemory ? conclusion.memory.store : undefined))
+        if (!staged) { policyChanged(); return }
         trace('staged', { id, dir, sessionId })
         notifySourceSession(session, `后台复盘产出「${label}」已暂存待确认（mode=approval）：${(hasSkill ? conclusion.rationale : conclusion.memory.rationale) || conclusion.action}`)
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
@@ -1893,7 +1971,7 @@ module.exports = {
       }
       // ── auto：skill 通道（memory 结论失败不连坐 skill，两通道独立守卫独立落盘）──
       if (hasSkill) {
-        const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir() })
+        const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir(), canWrite: () => canWrite('auto') })
         trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
         if (outcome.result === 'created' || outcome.result === 'patched') {
           ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
@@ -1909,10 +1987,13 @@ module.exports = {
       // ── auto：memory 通道（§12.4）──
       if (hasMemory) {
         const mem = conclusion.memory
+        const live = effective()
+        if (!canWrite('auto', mem.store)) { policyChanged(); return }
         const outcome = await applyMemoryConclusion(mem, {
           dir: wsDir || memoryDir(),
-          limits: { memory: eff.memoryCharLimit, user: eff.userCharLimit },
-          enabled: { memory: eff.memoryEnabled !== false, user: eff.userProfileEnabled !== false },
+          limits: { memory: live.memoryCharLimit, user: live.userCharLimit },
+          enabled: { memory: live.memoryEnabled !== false, user: live.userProfileEnabled !== false },
+          canWrite: () => canWrite('auto', mem.store),
           // 工作区库文件带 cwd 头注释自描述（slug 不可逆）；全局库不写，保持 v0.5 格式
           header: wsDir !== undefined && sessionCwd !== undefined ? workspaceCwdHeader(sessionCwd) : undefined,
         })
@@ -1936,8 +2017,6 @@ module.exports = {
     const onSessionEvent = (session, event) => {
       try {
         const eff = effective()
-        if (!eff.enabled) return
-        if (!ctx.agents || !ctx.agentDefaultModel) return
         const sessionId = session && session.id
         if (typeof sessionId !== 'string') return
         // 防自反馈：自己的 review 会话 + 一切 subagent 会话都不触发
@@ -1951,6 +2030,7 @@ module.exports = {
           if (running !== null && running.sessionId === sessionId) running.controller.abort()
           return
         }
+        if (!eff.enabled || !ctx.agents || !ctx.agentDefaultModel) return
         if (event.type === 'tool/call') {
           stateFor(sessionId).toolCalls += 1 // 随时累计，结算点在 turn 尾（与 Hermes turn_finalizer 同构）
           // 技能调用统计：tool/call 的 arguments 里带技能名（apiproxy 同款解析）
@@ -2022,13 +2102,13 @@ module.exports = {
         const cooledDown = Date.now() - st.lastReviewAt >= eff.cooldownMinutes * 60 * 1000
         const hitTurn = eff.turnInterval > 0 && st.turns >= eff.turnInterval
         const hitTools = eff.toolCallInterval > 0 && st.toolCalls >= eff.toolCallInterval
-        const accelerated = st.signal !== undefined
+        const accelerated = eff.signalTriggerEnabled && st.signal !== undefined
         trace('threshold', { sessionId, turns: st.turns, toolCalls: st.toolCalls, cooledDown, hitTurn, hitTools, accelerated })
         // 信号命中 → 跳过 turn/工具阈值提前结算；冷却仍然生效（防刷屏），
         // 冷却期内的标记保留到冷却结束后的下一个 turn 尾再消费
         if (!cooledDown || (!hitTurn && !hitTools && !accelerated)) return
 
-        const task = () => runReview({ session, eff })
+        const task = () => runReview({ session, signalOnly: !hitTurn && !hitTools })
         if (running === null) {
           // 同步直调（running 立即置位），不隔微任务
           task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
@@ -2307,6 +2387,7 @@ module.exports = {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
         queuedCount: queued.size,
+        queueDurability: 'volatile',
         sessions,
         current: current || { turns: 0, toolCalls: 0, lastReviewAt: undefined },
         activity,
@@ -2371,7 +2452,7 @@ module.exports = {
                   return
                 }
                 const wasRunning = running !== null
-                const task = () => runReview({ session, eff: effective(), manual: true })
+                const task = () => runReview({ session, manual: true })
                 if (!wasRunning) {
                   task().catch((e) => ctx.logger.warn(`hermes-loop: manual review: ${e && e.message}`)) // 同步直调置 running
                 } else {

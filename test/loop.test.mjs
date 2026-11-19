@@ -1240,6 +1240,185 @@ test('review fix: two same-tick thresholds never run concurrently (serial invari
   assert.equal(maxInFlight, 1, 'never concurrent')
 })
 
+// The model and stalled operations are fakes; the real queue, cancellation and writes run.
+for (const phase of ['snapshot', 'create', 'idle']) {
+  test('review deadline drains a queue stalled in ' + phase, async (t) => {
+    const { promise: hold, resolve: release } = Promise.withResolvers()
+    const { promise: entered, resolve: enter } = Promise.withResolvers()
+    const services = fakeServices('{"action":"nothing"}')
+    const stale = fakeIdleAgent('{"action":"create","skill":"discard-' + phase + '","description":"d","body":"fixture"}')
+    let sent = 0
+    let cancelled = 0
+    let disposed = 0
+    let creates = 0
+    let snapshots = 0
+    let snapshotSignal
+    stale.followup = () => { sent++ }
+    stale.cancel = () => { cancelled++ }
+    if (phase === 'idle') stale.whenIdle = () => { enter(); return hold }
+    const handle = { agent: stale, dispose: async () => { disposed++ } }
+    services.skills = { snapshot: ({ signal }) => {
+      if (++snapshots === 1 && phase === 'snapshot') { snapshotSignal = signal; enter(); return hold }
+      return { skills: [] }
+    } }
+    services.agents.create = (options) => {
+      assert.equal(Object.hasOwn(options, 'signal'), false, 'issue #7: create must not get a parent signal')
+      if (++creates !== 1 || phase === 'snapshot') return { agent: fakeIdleAgent('{"action":"nothing"}'), dispose: async () => {} }
+      if (phase === 'create') { enter(); return hold }
+      return handle
+    }
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const p = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto', reviewTimeoutSec: 30, memoryEnabled: false, userProfileEnabled: false }, services)
+    const fire = (id) => p.fire({ id, header: {}, deriveMessages: () => [] }, completedTurn)
+    fire('deadline-first-' + phase)
+    fire('deadline-next-' + phase)
+    await entered
+    t.mock.timers.tick(30_000)
+    await new Promise(setImmediate)
+    assert.ok(p.infos.some((m) => m.includes('deadline-next-' + phase) && m.includes('→ nothing')), 'the queued review must finish before the stalled promise settles')
+    if (phase === 'snapshot') assert.equal(snapshotSignal.aborted, true)
+    release(phase === 'snapshot' ? { skills: [] } : handle)
+    await new Promise(setImmediate)
+    assert.equal(creates, phase === 'snapshot' ? 1 : 2, 'late completion must not start extra work')
+    assert.equal(sent, phase === 'idle' ? 1 : 0, 'late handle must never receive a prompt')
+    assert.equal(cancelled, phase === 'snapshot' ? 0 : 1)
+    assert.equal(disposed, phase === 'snapshot' ? 0 : 1)
+    await assert.rejects(readFile(join(process.env.DSH_HOME, 'skills', 'discard-' + phase, 'SKILL.md')), { code: 'ENOENT' })
+  })
+}
+
+test('review disposal cannot stall the queue or lose its serial slot', async (t) => {
+  const { promise: disposed, resolve: disposing } = Promise.withResolvers()
+  const { promise: hold, reject } = Promise.withResolvers()
+  const services = fakeServices('{"action":"nothing"}')
+  let creates = 0
+  services.agents.create = () => ({
+    agent: fakeIdleAgent('{"action":"nothing"}'),
+    dispose: ++creates === 1 ? () => { disposing(); return hold } : async () => {},
+  })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const p = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only', memoryEnabled: false, userProfileEnabled: false }, services)
+  const fire = (id) => p.fire({ id, header: {}, deriveMessages: () => [] }, completedTurn)
+  fire('dispose-first')
+  fire('dispose-queued')
+  await disposed
+  fire('dispose-new')
+  await new Promise(setImmediate)
+  assert.equal(creates, 1, 'cleanup must keep its slot until it settles or the grace period expires')
+  t.mock.timers.tick(5_000)
+  await new Promise(setImmediate)
+  assert.deepEqual(p.infos.filter((m) => m.includes('→ nothing')).map((m) => m.match(/dispose-[a-z]+/)[0]), ['dispose-first', 'dispose-queued', 'dispose-new'])
+  reject(new Error('late dispose rejection')) // node:test fails on unhandled rejections
+  await new Promise(setImmediate)
+})
+
+test('foreground cancellation during create drains the queue and handles a late rejection', async () => {
+  const { promise: hold, reject } = Promise.withResolvers()
+  const { promise: entered, resolve: enter } = Promise.withResolvers()
+  const services = fakeServices('{"action":"nothing"}')
+  let creates = 0
+  services.agents.create = (options) => {
+    assert.equal(Object.hasOwn(options, 'signal'), false)
+    if (++creates === 1) { enter(); return hold }
+    return { agent: fakeIdleAgent('{"action":"nothing"}'), dispose: async () => {} }
+  }
+  const p = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only', memoryEnabled: false, userProfileEnabled: false }, services)
+  const first = { id: 'foreground-first', header: {}, deriveMessages: () => [] }
+  p.fire(first, completedTurn)
+  p.fire({ ...first, id: 'foreground-next' }, completedTurn)
+  await entered
+  p.fire(first, { type: 'turn/start' })
+  await new Promise(setImmediate)
+  assert.equal(creates, 2, 'foreground abort must not wait for create to settle')
+  reject(new Error('late create rejection')) // node:test fails on unhandled rejections
+  await new Promise(setImmediate)
+})
+
+async function updateReviewSettings(p, patch) {
+  const res = fakeRes()
+  await p.routes[0].handler(postJson('/hermes-loop/api/settings', { patch }), res)
+  assert.equal(res.statusCode, 200)
+}
+
+for (const [patch, signalOnly] of [[{ enabled: false }, false], [{ signalTriggerEnabled: false }, true]]) {
+  test('queued automatic review checks live ' + Object.keys(patch)[0], async (t) => {
+    const first = Promise.withResolvers()
+    const done = Promise.withResolvers()
+    const services = fakeServices('{"action":"nothing"}')
+    let creates = 0
+    services.agents.create = () => ({
+      agent: { ...fakeIdleAgent('{"action":"nothing"}'), whenIdle: () => ++creates === 1 ? first.promise : undefined },
+      dispose: async () => { done.resolve() },
+    })
+    const p = setupPlugin({ turnInterval: 1, toolCallInterval: 50, cooldownMinutes: 0, mode: 'log-only', memoryEnabled: false, userProfileEnabled: false, signalTriggerEnabled: true }, services)
+    t.after(() => p.cleanups.forEach((f) => { if (typeof f === 'function') f() }))
+    const session = (id) => ({ id, header: {}, deriveMessages: () => [] })
+    p.fire(session('live-gate-first'), completedTurn)
+    if (signalOnly) {
+      await updateReviewSettings(p, { turnInterval: 50 })
+      p.fire(session('live-gate-waiting'), { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+    }
+    p.fire(session('live-gate-waiting'), completedTurn)
+    await updateReviewSettings(p, patch)
+    first.resolve()
+    await done.promise
+    await new Promise(setImmediate)
+    assert.equal(creates, 1)
+  })
+}
+
+for (const [suffix, mode, patch, action, expected] of [
+  ['halt', 'auto', { enabled: false }, 'create', 'write-policy-changed'],
+  ['dry', 'auto', { mode: 'log-only' }, 'create', 'log-only mode'],
+  ['pending', 'approval', { mode: 'log-only' }, 'create', 'log-only mode'],
+  ['mem', 'auto', { memoryEnabled: false }, 'memory', 'store-disabled'],
+  ['user', 'approval', { userProfileEnabled: false }, 'user', 'store-disabled'],
+]) {
+  test('active automatic review honors live persistence policy: ' + suffix, async (t) => {
+    const idle = Promise.withResolvers()
+    const entered = Promise.withResolvers()
+    const done = Promise.withResolvers()
+    const sid = 'live-write-' + suffix
+    const result = action === 'create'
+      ? { action: 'create', skill: sid, description: 'Fixture skill', body: 'Fixture content' }
+      : { action: 'nothing', memory: { store: action === 'memory' ? 'memory' : 'user', action: 'add', text: sid } }
+    const agent = fakeIdleAgent(JSON.stringify(result))
+    const services = fakeServices('')
+    services.agents.create = () => ({ agent: { ...agent, whenIdle: () => { entered.resolve(); return idle.promise } }, dispose: async () => { done.resolve() } })
+    const p = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode, memoryEnabled: true, userProfileEnabled: true }, services)
+    t.after(() => p.cleanups.forEach((f) => { if (typeof f === 'function') f() }))
+    p.fire({ id: sid, header: {}, deriveMessages: () => [] }, completedTurn)
+    await entered.promise
+    await updateReviewSettings(p, patch)
+    idle.resolve()
+    await done.promise
+    assert.ok([...p.infos, ...p.warns].some((m) => m.includes(sid) && m.includes(expected)), [...p.infos, ...p.warns].join('\n'))
+    assert.ok(!p.infos.some((m) => m.includes(sid) && /— (created|added|staged)/.test(m)))
+    const { globalSkillsDir, pendingDir, memoryStoreFile } = plugin.__internals
+    if (action === 'create') await assert.rejects(readFile(join(globalSkillsDir(), sid, 'SKILL.md')), { code: 'ENOENT' })
+    const pending = await readdir(pendingDir()).catch((e) => { if (e.code === 'ENOENT') return []; throw e })
+    assert.ok(!pending.some((file) => file.endsWith('.json')), 'suppressed reviews must not stage approval')
+    if (action !== 'create') {
+      const raw = await readFile(memoryStoreFile(action), 'utf8').catch((e) => { if (e.code === 'ENOENT') return ''; throw e })
+      assert.ok(!raw.includes(sid), 'suppressed memory must not appear on disk')
+    }
+  })
+}
+
+test('skill persistence rechecks approval immediately before adopting a temp file', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'hermes-loop-live-adopt-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  let checks = 0
+  const skill = 'fixture-skill'
+  const outcome = await applyConclusion({ action: 'create', skill, description: 'Fixture', body: 'Fixture text' }, {
+    globalDir: dir,
+    canWrite: () => ++checks === 1,
+  })
+  assert.equal(outcome.result, 'write-policy-changed')
+  assert.equal(checks, 2)
+  assert.deepEqual(await readdir(join(dir, skill)), [], 'neither destination nor temporary file may remain')
+})
+
 test('review fix: settings fallback path validates instead of raw Object.assign', async () => {
   const { sanitizeSettingsPatch } = plugin.__internals
   assert.deepEqual(sanitizeSettingsPatch({ mode: 'typo', turnInterval: 0, cooldownMinutes: -5 }), {})
